@@ -1,225 +1,239 @@
-// Selemene Trend Rider v2: a cbBTC bot for 1-minute bars (agent-fun/bars-replay/v1).
+// Selemene Trend Rider, second build: a cbBTC rider for one-minute
+// bars on the agent-fun/bars-replay/v1 protocol.
 //
-// v1 (EMA 45/120 regime, 65% sizing, 0.9% trailing stop) made $2.07 on
-// the dev window with 4 trades and 18% exposure: right shape, too slow
-// and too small. v2 keeps the one design that made money on that window
-// and sharpens every part of it:
+// The whole idea fits in one paragraph. The bot keeps its money in
+// cash while the tape is ambiguous, and commits almost all of it only
+// when a real uptrend is in charge: the fast exponential average must
+// sit clearly above the slow one, the latest close must hold above
+// the fast average, and the last ten bars must not have lost ground
+// overall. Once in, a trailing stop is the only ordinary way out —
+// the position is sold when the close falls 0.7 percent (70 bps)
+// under the best close seen since entry. A separate brake watches the
+// account itself: if equity ever sinks eight percent below its peak,
+// everything is sold and the bot parks for two hours of bars.
 //
-// - Regime filter, faster: the fast EMA (30 bars) must sit at least
-//   5 bps above the slow EMA (90 bars), and the close above the fast
-//   EMA. v1's 45/120 pair entered the dev day's big midday recovery
-//   about 55 bars late; 30/90 enters materially earlier while still
-//   keeping the bot in cash through the day's three hard down-legs
-//   (-2.6%, -1.6%, -2.8%), where any long loses.
-// - Sizing: 95% of equity (v1: 65%). A full-size round trip costs
-//   roughly 26-39 bps in fees, slippage and pool impact, so the bot
-//   only rides moves that are expected to be several times that, and
-//   rides them near full size when they come.
-// - Exit: a 0.7% trailing stop under the best close since entry (v1:
-//   0.9%). The dev day's recoveries rolled over fast; the tighter stop
-//   banks more of each leg. There is deliberately no regime-flip exit:
-//   tested on this window, flip exits churned in the second half's
-//   chop and turned the day negative. Entry also requires the last
-//   10 bars to sum non-negative, which keeps the bot from buying the
-//   first dead bounce inside a still-falling tape.
-// - After any exit the bot waits 5 bars before re-entering, so chop at
-//   a leg top cannot bleed it through repeated round-trip fees.
-// - Drawdown brake: if equity falls 8% under its peak, flatten and sit
-//   out 120 bars. The race ranks an entry below the whole field when
-//   its max drawdown exceeds 25%; this brake keeps a bad live day far
-//   from that line (the dev window's max drawdown here is ~1.3%).
-//
-// Faster systems were tested and rejected on the dev window: raw
-// momentum entries, Donchian breakouts, EMA crosses and dip-buying all
-// lost money there, because the day's up-legs reverse quickly and each
-// round trip costs ~0.3%. Patient regime-riding with a tight trailing
-// stop was the only family that stayed profitable across parameter
-// perturbations, so v2 is that, tuned up, rather than a new gamble.
-//
-// The bot is a pure function of the bars it has seen: no clock, no
-// randomness, no files, no network. Two runs on the same data give the
-// same orders byte for byte.
+// The program is a pure function of the lines it reads. It consults
+// no clock, rolls no dice, opens no files and touches no network, so
+// the same input stream always earns the same orders back.
 
 import { createInterface } from "node:readline";
 
-const FAST = 30; // fast EMA length in bars
-const SLOW = 90; // slow EMA length in bars
-const BAND = 0.0005; // entry needs fast EMA at least 5 bps above slow EMA
-const MOM_BARS = 10; // entry also needs the last 10 bars not down in sum
-const SIZE_FRAC = 0.95; // share of equity spent on an entry
-const TRAIL = 0.007; // trailing stop
-const DD_BRAKE = 0.08; // drawdown brake: flatten at 8% under the equity peak
-const DD_COOLDOWN = 120; // bars sat out after the brake fires
-const REENTRY_WAIT = 5; // bars to wait after any exit before re-entering
-const BUY_SLIP_BPS = 400; // max_slippage_bps on buys
-const SELL_SLIP_BPS = 500; // max_slippage_bps on sells (exits must not be refused)
-const MIN_NOTIONAL = 1000000; // 1 USDC in quote units
+// ---- strategy constants --------------------------------------------------
+const FAST_LEN = 30;      // fast EMA length, in bars
+const SLOW_LEN = 90;      // slow EMA length, in bars
+const GAP_BPS = 5;        // fast EMA must lead the slow one by this
+const LOOKBACK = 10;      // bars in the no-loss momentum check
+const COMMIT_BPS = 9500;  // share of equity committed on an entry
+const TRAIL_BPS = 70;     // trailing stop distance (0.7 percent)
+const BRAKE_BPS = 800;    // equity drawdown that trips the brake (8%)
+const PARK_BARS = 120;    // bars sat out once the brake has tripped
+const REST_BARS = 5;      // bars sat out after an ordinary exit
+const BUY_SLIP_BPS = 400; // slippage tolerance on entries
+const SELL_SLIP_BPS = 500; // slippage tolerance on exits
 
-type Order = { [key: string]: unknown };
-
+// ---- the bot ---------------------------------------------------------------
 class TrendRider {
-  symbol: string | null = null;
-  warmupBars = 0;
-  barsSeen = 0;
-  closes: number[] = [];
-  emaFast: number | null = null;
-  emaSlow: number | null = null;
-  orderCount = 0;
-  peakSinceEntry: number | null = null;
-  peakEquity: number | null = null;
-  cooldown = 0;
-  reentryWait = 0;
-  wasHolding = false;
-
-  onHello(msg: { [key: string]: unknown }): void {
-    const symbols = (msg["symbols"] as { [key: string]: unknown }[]) || [];
-    if (symbols.length > 0) this.symbol = String(symbols[0]["symbol"]);
-    this.warmupBars = Number(msg["warmup_bars"] || 0);
+  constructor() {
+    this.symbol = null;        // trading symbol, learned from hello
+    this.warmupBars = 0;       // harness warmup: no orders count there
+    this.minNotional = 1000000n; // smallest order the venue accepts
+    this.barCount = 0;         // bars of our symbol seen so far
+    this.closes = [];          // recent closes, newest last, capped
+    this.emaFast = null;       // EMA(FAST_LEN) of the close
+    this.emaSlow = null;       // EMA(SLOW_LEN) of the close
+    this.cash = 0n;            // quote units, as last reported
+    this.qty = 0n;             // asset units held, as last reported
+    this.qtyText = "0";        // the same quantity, as a raw string
+    this.equity = 0n;          // quote units, as last reported
+    this.peakEquity = 0n;      // best equity ever reported
+    this.bestClose = 0;        // best close since the current entry
+    this.pending = null;       // null, "buy" or "sell": order in flight
+    this.exitKind = null;      // for a sell in flight: "trail"/"brake"
+    this.park = 0;             // brake sit-out bars remaining
+    this.rest = 0;             // post-exit rest bars remaining
+    this.orderSeq = 0;         // counter for unique client ids
   }
 
-  ema(prev: number | null, value: number, length: number): number {
-    if (prev === null) return value;
-    const k = 2 / (length + 1);
-    return prev + k * (value - prev);
-  }
-
-  nextId(): string {
-    this.orderCount += 1;
-    return "o" + this.orderCount;
-  }
-
-  buy(notional: number): Order {
-    return {
-      side: "buy",
-      client_id: this.nextId(),
-      symbol: this.symbol,
-      notional_quote_units: String(Math.floor(notional)),
-      max_slippage_bps: BUY_SLIP_BPS,
-    };
-  }
-
-  sell(qty: number): Order {
-    return {
-      side: "sell",
-      client_id: this.nextId(),
-      symbol: this.symbol,
-      qty: String(qty),
-      max_slippage_bps: SELL_SLIP_BPS,
-    };
-  }
-
-  onBatch(msg: { [key: string]: unknown }): { [key: string]: unknown } {
-    const account = (msg["account"] as { [key: string]: unknown }) || {};
-    const cash = Number(account["cash_quote_units"] || 0);
-    const equity = Number(account["equity_quote_units"] || 0);
-    let qty = 0;
-    const positions = (account["positions"] as { [key: string]: unknown }[]) || [];
-    for (const pos of positions) {
-      if (pos["symbol"] === this.symbol) qty = Number(pos["qty"] || 0);
+  onHello(msg) {
+    const first = (msg.symbols || [])[0] || {};
+    this.symbol = String(first.symbol || "CBBTC");
+    this.warmupBars = Number(msg.warmup_bars || 0);
+    const fees = msg.fees || {};
+    if (fees.min_notional_quote_units !== undefined) {
+      this.minNotional = BigInt(fees.min_notional_quote_units);
     }
+    const cap = msg.capital || {};
+    if (cap.quote_units !== undefined) {
+      this.cash = BigInt(cap.quote_units);
+      this.equity = this.cash;
+      this.peakEquity = this.cash;
+    }
+  }
 
-    let close: number | null = null;
-    const bars = (msg["bars"] as { [key: string]: unknown }[]) || [];
-    for (const b of bars) {
-      if (b["symbol"] === this.symbol) {
-        close = Number(b["c"]);
-        break;
+  // Fold one batch's account report into local state.
+  syncAccount(account) {
+    if (!account) return;
+    this.cash = BigInt(account.cash_quote_units || "0");
+    this.equity = BigInt(account.equity_quote_units || "0");
+    this.qty = 0n;
+    this.qtyText = "0";
+    for (const pos of account.positions || []) {
+      if (pos.symbol === this.symbol) {
+        this.qty = BigInt(pos.qty || "0");
+        this.qtyText = String(pos.qty || "0");
       }
     }
-
-    let orders: Order[] = [];
-    if (close !== null) {
-      this.barsSeen += 1;
-      this.closes.push(close);
-      this.emaFast = this.ema(this.emaFast, close, FAST);
-      this.emaSlow = this.ema(this.emaSlow, close, SLOW);
-      orders = this.decide(close, cash, equity, qty);
-    }
-    return { type: "reply", seq: msg["seq"], orders };
+    if (this.equity > this.peakEquity) this.peakEquity = this.equity;
   }
 
-  decide(close: number, cash: number, equity: number, qty: number): Order[] {
-    const holding = qty > 0;
-
-    // Track the best close since the position appeared.
-    if (holding) {
-      if (!this.wasHolding || this.peakSinceEntry === null) {
-        this.peakSinceEntry = close;
-      } else if (close > this.peakSinceEntry) {
-        this.peakSinceEntry = close;
-      }
+  // Update the averages and the momentum window with one close.
+  absorbClose(close) {
+    this.barCount += 1;
+    this.closes.push(close);
+    if (this.closes.length > LOOKBACK + 1) this.closes.shift();
+    if (this.emaFast === null) {
+      this.emaFast = close;
+      this.emaSlow = close;
     } else {
-      if (this.wasHolding) this.reentryWait = REENTRY_WAIT;
-      this.peakSinceEntry = null;
+      const kFast = 2 / (FAST_LEN + 1);
+      const kSlow = 2 / (SLOW_LEN + 1);
+      this.emaFast += (close - this.emaFast) * kFast;
+      this.emaSlow += (close - this.emaSlow) * kSlow;
     }
-    this.wasHolding = holding;
+  }
 
-    // Drawdown brake bookkeeping.
-    if (this.peakEquity === null || equity > this.peakEquity) {
-      this.peakEquity = equity;
-    }
-    const brake =
-      this.cooldown === 0 &&
-      this.peakEquity !== null &&
-      this.peakEquity > 0 &&
-      equity <= this.peakEquity * (1 - DD_BRAKE);
-    if (brake) {
-      this.cooldown = DD_COOLDOWN;
-      this.peakEquity = equity;
-      return holding ? [this.sell(qty)] : [];
-    }
-    if (this.cooldown > 0) {
-      this.cooldown -= 1;
-      return holding ? [this.sell(qty)] : [];
-    }
-    if (this.reentryWait > 0) this.reentryWait -= 1;
+  warmedUp() {
+    return this.barCount >= SLOW_LEN && this.barCount > this.warmupBars;
+  }
 
-    if (this.barsSeen <= Math.max(this.warmupBars, SLOW + 2)) return [];
-    if (this.emaFast === null || this.emaSlow === null) return [];
+  uptrend(close) {
+    if (this.emaFast === null || this.emaSlow === null) return false;
+    if (this.closes.length < LOOKBACK + 1) return false;
+    const leadOk = this.emaFast >= this.emaSlow * (1 + GAP_BPS / 10000);
+    const aboveOk = close > this.emaFast;
+    const past = this.closes[this.closes.length - 1 - LOOKBACK];
+    const momentumOk = past > 0 && close / past - 1 >= 0;
+    return leadOk && aboveOk && momentumOk;
+  }
 
-    if (holding) {
-      const trailed =
-        this.peakSinceEntry !== null &&
-        close <= this.peakSinceEntry * (1 - TRAIL);
-      if (trailed) return [this.sell(qty)];
-      return [];
+  brakeTripped() {
+    if (this.peakEquity <= 0n) return false;
+    const floor = this.peakEquity * BigInt(10000 - BRAKE_BPS);
+    return this.equity * 10000n <= floor;
+  }
+
+  makeOrder(side, extra) {
+    this.orderSeq += 1;
+    return Object.assign(
+      { side: side, client_id: "rider-" + this.orderSeq, symbol: this.symbol },
+      extra
+    );
+  }
+
+  sellEverything(kind) {
+    this.pending = "sell";
+    this.exitKind = kind;
+    return this.makeOrder("sell", {
+      qty: this.qtyText,
+      max_slippage_bps: SELL_SLIP_BPS,
+    });
+  }
+
+  onBatch(msg) {
+    const orders = [];
+    // Work through every bar of our symbol, in order, then decide once.
+    let close = null;
+    for (const bar of msg.bars || []) {
+      if (bar.symbol !== this.symbol) continue;
+      close = Number(bar.c);
+      this.absorbClose(close);
+    }
+    this.syncAccount(msg.account);
+    if (close === null) return orders;
+
+    // Settle an order that was in flight when this batch arrived: the
+    // fills behind it are already reflected in the account report.
+    if (this.pending === "buy") {
+      if (this.qty > 0n) this.bestClose = close;
+      this.pending = null;
+    } else if (this.pending === "sell") {
+      if (this.qty === 0n) {
+        if (this.exitKind === "brake") this.park = PARK_BARS;
+        else this.rest = REST_BARS;
+        this.bestClose = 0;
+      }
+      this.pending = null;
+      this.exitKind = null;
     }
 
-    // Flat: look for an entry.
-    if (this.reentryWait > 0) return [];
-    if (this.closes.length <= MOM_BARS) return [];
-    const regimeUp = this.emaFast > this.emaSlow * (1 + BAND);
-    const aboveFast = close > this.emaFast;
-    const momentum =
-      this.closes[this.closes.length - 1] /
-        this.closes[this.closes.length - 1 - MOM_BARS] -
-      1;
-    if (regimeUp && aboveFast && momentum >= 0) {
-      let notional = Math.floor(equity * SIZE_FRAC);
-      if (notional > cash) notional = cash;
-      if (notional >= MIN_NOTIONAL) return [this.buy(notional)];
+    // Sit-out timers tick once per batch.
+    if (this.park > 0) this.park -= 1;
+    if (this.rest > 0) this.rest -= 1;
+
+    const holding = this.qty > 0n;
+
+    // The brake outranks everything: a deep equity drawdown flattens
+    // the position and starts the long sit-out once the sale lands.
+    if (!this.pending && holding && this.brakeTripped()) {
+      orders.push(this.sellEverything("brake"));
+      return orders;
     }
-    return [];
+
+    // Ordinary exit: the trailing stop, measured on closes against
+    // the best close since the entry filled.
+    if (!this.pending && holding) {
+      if (close > this.bestClose) this.bestClose = close;
+      const stopLine = this.bestClose * (1 - TRAIL_BPS / 10000);
+      if (this.bestClose > 0 && close <= stopLine) {
+        orders.push(this.sellEverything("trail"));
+        return orders;
+      }
+    }
+
+    // Entry: flat, rested, warmed up, and a confirmed uptrend.
+    if (
+      !this.pending &&
+      !holding &&
+      this.park === 0 &&
+      this.rest === 0 &&
+      this.warmedUp() &&
+      this.uptrend(close)
+    ) {
+      let notional = (this.equity * BigInt(COMMIT_BPS)) / 10000n;
+      if (notional > this.cash) notional = this.cash;
+      if (notional >= this.minNotional) {
+        this.pending = "buy";
+        orders.push(
+          this.makeOrder("buy", {
+            notional_quote_units: notional.toString(),
+            max_slippage_bps: BUY_SLIP_BPS,
+          })
+        );
+      }
+    }
+    return orders;
   }
 }
 
-async function main(): Promise<void> {
-  const bot = new TrendRider();
-  const rl = createInterface({ input: process.stdin, terminal: false });
-  for await (const line of rl) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    const msg = JSON.parse(trimmed) as { [key: string]: unknown };
-    const kind = msg["type"];
-    if (kind === "hello") {
-      bot.onHello(msg);
-    } else if (kind === "batch") {
-      const reply = bot.onBatch(msg);
-      process.stdout.write(JSON.stringify(reply) + "\n");
-    } else if (kind === "done") {
-      break;
-    }
-  }
-}
+// ---- wire loop ---------------------------------------------------------------
+const rider = new TrendRider();
+const lines = createInterface({ input: process.stdin, crlfDelay: Infinity });
 
-void main();
+lines.on("line", (line) => {
+  const text = line.trim();
+  if (!text) return;
+  let msg;
+  try {
+    msg = JSON.parse(text);
+  } catch {
+    return;
+  }
+  if (msg.type === "hello") {
+    rider.onHello(msg);
+  } else if (msg.type === "batch") {
+    const orders = rider.onBatch(msg);
+    const reply = { type: "reply", seq: msg.seq, orders: orders };
+    process.stdout.write(JSON.stringify(reply) + "\n");
+  }
+  // A "done" message needs no answer; closing stdin ends the process.
+});
