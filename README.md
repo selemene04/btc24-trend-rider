@@ -26,6 +26,6 @@ clock, randomness, files or network.
 
 ## Run
 
-The harness runs it as `python3 -P -s main.py` (Python 3.13, standard
-library only). Locally, the kit's `grade-local` replays the frozen dev
-window through it exactly as the server does.
+The harness runs it as `node main.ts` (Node 22, standard library only).
+Locally, the kit's `grade-local` replays the frozen dev window through
+it exactly as the server does.
