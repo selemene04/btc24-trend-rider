@@ -9,7 +9,7 @@ line in per minute, one reply with orders out.
 
 The bot only holds risk while the market trends up:
 
-- **Regime filter** — fast EMA (30 bars) above slow EMA (120 bars), or it
+- **Regime filter** — fast EMA (45 bars) above slow EMA (120 bars), or it
   holds cash. A plain buy-and-hold loses money on a falling window and
   fails the dev gate; the filter keeps the bot out of downtrends.
 - **Entry** — in an uptrend, close above the fast EMA and the last

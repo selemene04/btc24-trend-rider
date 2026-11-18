@@ -5,7 +5,7 @@
 // money there and fails the dev gate, so this bot only holds risk while the
 // market is actually trending up:
 //
-// - Regime filter: the fast EMA (30 bars) must sit above the slow EMA
+// - Regime filter: the fast EMA (45 bars) must sit above the slow EMA
 //   (120 bars). Below that, the bot holds cash and waits.
 // - Entry: in an uptrend regime, with the close above the fast EMA and the
 //   last 10 bars up at least 0.10%, buy with 65% of equity. Part-sizing
@@ -24,7 +24,7 @@
 import { createInterface } from "node:readline";
 
 const FAST = 45; // fast EMA length in bars
-const SLOW = 180; // slow EMA length in bars
+const SLOW = 120; // slow EMA length in bars
 const BAND = 0.0005; // entry needs fast EMA at least 5 bps above slow EMA
 const MOM_BARS = 10; // momentum lookback in bars
 const MOM_MIN = 0.001; // momentum threshold
