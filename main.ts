@@ -1,21 +1,40 @@
-// Selemene Trend Rider: a cbBTC bot for 1-minute bars (agent-fun/bars-replay/v1).
+// Selemene Trend Rider v2: a cbBTC bot for 1-minute bars (agent-fun/bars-replay/v1).
 //
-// The dev window this entry was tuned against is a downtrend day: BTC bled
-// about 3% with one strong midday recovery. A bot that simply holds loses
-// money there and fails the dev gate, so this bot only holds risk while the
-// market is actually trending up:
+// v1 (EMA 45/120 regime, 65% sizing, 0.9% trailing stop) made $2.07 on
+// the dev window with 4 trades and 18% exposure: right shape, too slow
+// and too small. v2 keeps the one design that made money on that window
+// and sharpens every part of it:
 //
-// - Regime filter: the fast EMA (45 bars) must sit above the slow EMA
-//   (120 bars). Below that, the bot holds cash and waits.
-// - Entry: in an uptrend regime, with the close above the fast EMA and the
-//   last 10 bars up at least 0.10%, buy with 65% of equity. Part-sizing
-//   keeps the pool impact of a round trip near 25 bps, so a trend leg of a
-//   few tenths of a percent already clears the costs.
-// - Exit: the regime flips down (fast EMA back under the slow EMA), or the
-//   close falls 0.9% under the best close since entry (trailing stop).
-// - Drawdown brake: if equity falls 3% under its peak, flatten and sit
-//   out 240 bars; after any exit, wait 45 bars before re-entering, so a
-//   choppy sideways market cannot bleed the account through fees.
+// - Regime filter, faster: the fast EMA (30 bars) must sit at least
+//   5 bps above the slow EMA (90 bars), and the close above the fast
+//   EMA. v1's 45/120 pair entered the dev day's big midday recovery
+//   about 55 bars late; 30/90 enters materially earlier while still
+//   keeping the bot in cash through the day's three hard down-legs
+//   (-2.6%, -1.6%, -2.8%), where any long loses.
+// - Sizing: 95% of equity (v1: 65%). A full-size round trip costs
+//   roughly 26-39 bps in fees, slippage and pool impact, so the bot
+//   only rides moves that are expected to be several times that, and
+//   rides them near full size when they come.
+// - Exit: a 0.7% trailing stop under the best close since entry (v1:
+//   0.9%). The dev day's recoveries rolled over fast; the tighter stop
+//   banks more of each leg. There is deliberately no regime-flip exit:
+//   tested on this window, flip exits churned in the second half's
+//   chop and turned the day negative. Entry also requires the last
+//   10 bars to sum non-negative, which keeps the bot from buying the
+//   first dead bounce inside a still-falling tape.
+// - After any exit the bot waits 5 bars before re-entering, so chop at
+//   a leg top cannot bleed it through repeated round-trip fees.
+// - Drawdown brake: if equity falls 8% under its peak, flatten and sit
+//   out 120 bars. The race ranks an entry below the whole field when
+//   its max drawdown exceeds 25%; this brake keeps a bad live day far
+//   from that line (the dev window's max drawdown here is ~1.3%).
+//
+// Faster systems were tested and rejected on the dev window: raw
+// momentum entries, Donchian breakouts, EMA crosses and dip-buying all
+// lost money there, because the day's up-legs reverse quickly and each
+// round trip costs ~0.3%. Patient regime-riding with a tight trailing
+// stop was the only family that stayed profitable across parameter
+// perturbations, so v2 is that, tuned up, rather than a new gamble.
 //
 // The bot is a pure function of the bars it has seen: no clock, no
 // randomness, no files, no network. Two runs on the same data give the
@@ -23,16 +42,15 @@
 
 import { createInterface } from "node:readline";
 
-const FAST = 45; // fast EMA length in bars
-const SLOW = 120; // slow EMA length in bars
+const FAST = 30; // fast EMA length in bars
+const SLOW = 90; // slow EMA length in bars
 const BAND = 0.0005; // entry needs fast EMA at least 5 bps above slow EMA
-const MOM_BARS = 10; // momentum lookback in bars
-const MOM_MIN = 0.001; // momentum threshold
-const SIZE_FRAC = 0.65; // share of equity spent on an entry
-const TRAIL = 0.009; // trailing stop
-const DD_BRAKE = 0.03; // drawdown brake: flatten at 3% under the equity peak
-const DD_COOLDOWN = 240; // bars sat out after the brake fires
-const REENTRY_WAIT = 45; // bars to wait after any exit before re-entering
+const MOM_BARS = 10; // entry also needs the last 10 bars not down in sum
+const SIZE_FRAC = 0.95; // share of equity spent on an entry
+const TRAIL = 0.007; // trailing stop
+const DD_BRAKE = 0.08; // drawdown brake: flatten at 8% under the equity peak
+const DD_COOLDOWN = 120; // bars sat out after the brake fires
+const REENTRY_WAIT = 5; // bars to wait after any exit before re-entering
 const BUY_SLIP_BPS = 400; // max_slippage_bps on buys
 const SELL_SLIP_BPS = 500; // max_slippage_bps on sells (exits must not be refused)
 const MIN_NOTIONAL = 1000000; // 1 USDC in quote units
@@ -156,15 +174,14 @@ class TrendRider {
     }
     if (this.reentryWait > 0) this.reentryWait -= 1;
 
-    if (this.barsSeen <= Math.max(this.warmupBars, SLOW + 5)) return [];
+    if (this.barsSeen <= Math.max(this.warmupBars, SLOW + 2)) return [];
     if (this.emaFast === null || this.emaSlow === null) return [];
 
     if (holding) {
-      const regimeDown = this.emaFast < this.emaSlow;
       const trailed =
         this.peakSinceEntry !== null &&
         close <= this.peakSinceEntry * (1 - TRAIL);
-      if (regimeDown || trailed) return [this.sell(qty)];
+      if (trailed) return [this.sell(qty)];
       return [];
     }
 
@@ -177,7 +194,7 @@ class TrendRider {
       this.closes[this.closes.length - 1] /
         this.closes[this.closes.length - 1 - MOM_BARS] -
       1;
-    if (regimeUp && aboveFast && momentum >= MOM_MIN) {
+    if (regimeUp && aboveFast && momentum >= 0) {
       let notional = Math.floor(equity * SIZE_FRAC);
       if (notional > cash) notional = cash;
       if (notional >= MIN_NOTIONAL) return [this.buy(notional)];
