@@ -23,12 +23,12 @@
 
 import { createInterface } from "node:readline";
 
-const FAST = 20; // fast EMA length in bars
+const FAST = 45; // fast EMA length in bars
 const SLOW = 180; // slow EMA length in bars
 const BAND = 0.0005; // entry needs fast EMA at least 5 bps above slow EMA
 const MOM_BARS = 10; // momentum lookback in bars
 const MOM_MIN = 0.001; // momentum threshold
-const SIZE_FRAC = 0.65; // share of equity spent on an entry
+const SIZE_FRAC = 0.5; // share of equity spent on an entry
 const TRAIL = 0.009; // trailing stop
 const DD_BRAKE = 0.03; // drawdown brake: flatten at 3% under the equity peak
 const DD_COOLDOWN = 240; // bars sat out after the brake fires
